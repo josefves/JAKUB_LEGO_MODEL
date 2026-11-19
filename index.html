@@ -52,10 +52,12 @@
 // Osa X = dlouhá strana kostela (věž je na straně -X), osa Z = krátká strana.
 window.CONFIG = {
   // JEDEN marker leží uprostřed půdorysu modelu (model je virtuální, marker nezakrývá)
-  markerSize: 0.18,          // černý čtverec 18 cm (list A4)
+  markerSize: 0.18,          // referenční velikost (A4)
+  // dva markery se stejnou funkcí, liší se kódem a velikostí – stránka pozná, který vidí
   markers: [
-    { id: 1, x: 0.00, z: 0.00, dir: [0, 1] },   // horní okraj (▲ PŘEDNÍ STRANA ▲) míří k přední dlouhé straně
-  ],
+    { id: 1, size: 0.18, x: 0.00, z: 0.00, dir: [0, 1] },   // A4: černý čtverec 18 cm
+    { id: 2, size: 0.09, x: 0.00, z: 0.00, dir: [0, 1] },   // kartička do peněženky: černý čtverec 9 cm
+  ],                                                        // horní okraj (▲ PŘEDNÍ ▲) míří k přední dlouhé straně
   hideAfterMs: 500,          // jak dlouho model zůstane po ztrátě markeru
   procLongSide: 960,         // rozlišení pro hledání markerů (menší = rychlejší, ?proc=640)
   focalDefault: 0.75         // ohnisko jako násobek delší strany obrazu (doladí se samo)
@@ -76,7 +78,7 @@ window.CONFIG = {
   };
   const rot = b => b.map((_, i) => b.map((_, j) => b[j][b.length - 1 - i])); // 90° counter-clockwise
   // marker with a QR code inside: 8x8 cells, 1-cell black border, 20-cell code ring, centre 4x4 = QR zone (ignored)
-  const RING = { 1: [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 1, 1, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1, 0, 1], [1, 1, 1, 1, 1, 1, 1, 1]] };
+  const RING = { 1: [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 1, 1, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1, 0, 1], [1, 1, 1, 1, 1, 1, 1, 1]], 2: [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 1, 0, 1, 1], [1, 0, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 1, 1], [1, 0, 0, 0, 0, 0, 1, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 1, 0, 0, 1, 0, 1], [1, 1, 1, 1, 1, 1, 1, 1]] };
   const RING_CELLS = [];
   for (let r = 1; r <= 6; r++) for (let c = 1; c <= 6; c++) if (r === 1 || r === 6 || c === 1 || c === 6) RING_CELLS.push([r, c]);
 
@@ -328,11 +330,11 @@ window.CONFIG = {
       const vals = sampleGrid(gray, w, h, q); if (!vals) continue;
       const dec = decode(vals); if (!dec) continue;
       const k = dec.k, corners = [0, 1, 2, 3].map(i => q[(i + k) % 4]); // TL, TR, BR, BL of the printed marker
-      found.push({ id: dec.id, corners, err: dec.d, area: qa });
+      found.push({ id: dec.id, corners, err: dec.d, area: qa, ring: !!dec.ring });
     }
     // keep the largest detection per id
     const best = {};
-    for (const m of found) if (!best[m.id] || m.area > best[m.id].area) best[m.id] = m;
+    for (const m of found) { const key = (m.ring ? 'r' : 'c') + m.id; if (!best[key] || m.area > best[key].area) best[key] = m; }
     return Object.values(best);
   }
 
@@ -497,7 +499,7 @@ for (const m of CFG.markers) {
   const g = new THREE.Group();
   g.position.set(m.x, 0.002, m.z);
   g.rotation.y = Math.atan2(-m.dir[0], -m.dir[1]) + OTOC * Math.PI / 180;
-  const s = CFG.markerSize;
+  const s = m.size || CFG.markerSize;
   const sq = new THREE.Mesh(new THREE.PlaneGeometry(s, s), new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, depthTest: false }));
   sq.rotation.x = -Math.PI / 2; sq.renderOrder = 10; g.add(sq);
   const dot = new THREE.Mesh(new THREE.CircleGeometry(0.04, 20), new THREE.MeshBasicMaterial({ color: 0xff2d75, side: THREE.DoubleSide, depthTest: false }));
@@ -519,7 +521,7 @@ const FLOOR = {};
 for (const m of CFG.markers) {
   const d = new THREE.Vector3(m.dir[0], 0, m.dir[1]).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), OTOC * Math.PI / 180);
   const right = new THREE.Vector3().crossVectors(d, new THREE.Vector3(0, 1, 0));
-  const c = new THREE.Vector3(m.x * S, 0, m.z * S), h = SIZE / 2;
+  const c = new THREE.Vector3(m.x * S, 0, m.z * S), h = (m.size || SIZE) / 2;
   FLOOR[m.id] = [[-h, h], [h, h], [h, -h], [-h, -h]].map(([X, Y]) => {
     const p = c.clone().addScaledVector(right, X).addScaledVector(d, Y); return [p.x, -p.z]; });
 }
@@ -638,7 +640,9 @@ function loop(t) {
   const id = pctx.getImageData(0, 0, pw, ph).data;
   const gray = new Uint8Array(pw * ph);
   for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = (id[i] * 77 + id[i + 1] * 150 + id[i + 2] * 29) >> 8;
-  const det = MarkerDetector.detect(gray, pw, ph).filter(m => OFF[m.id]);
+  // only the QR-ring markers; if both are visible use the bigger one in the image
+  let det = MarkerDetector.detect(gray, pw, ph).filter(m => m.ring && OFF[m.id]);
+  if (det.length > 1) det = [det.sort((a, b) => b.area - a.area)[0]];
   // all visible markers lie on one floor plane -> one joint pose (much more stable than a single marker)
   const obj = [], img = [];
   for (const m of det) for (let i = 0; i < 4; i++) { obj.push(FLOOR[m.id][i]); img.push(m.corners[i]); }
@@ -714,7 +718,7 @@ document.addEventListener('fullscreenchange', () => {
 addEventListener('resize', () => { lastW = 0; });
 if (!document.documentElement.requestFullscreen) btnFull.style.display = 'none';
 if (!MarkerDetector.fuseUp) diag('detector.js je stará verze – nahrajte nový soubor na GitHub', true);
-diag('LEGO kostel · verze 1 · marker A4 · ' + (SIZE * 100).toFixed(0) + ' cm' + (TEST ? ' · TEST' : ''));
+diag('LEGO kostel · verze 2 · markery A4 (18 cm) a kartička (9 cm)');
 </script>
 </body>
 </html>
