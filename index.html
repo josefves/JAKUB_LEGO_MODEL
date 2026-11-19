@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Kostel sv. Jakuba – AR</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#fff;font:15px/1.4 system-ui,sans-serif;
+            touch-action:manipulation;-webkit-user-select:none;user-select:none}
+  #v,#gl{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh}
+  #v{object-fit:cover;z-index:0;background:#000}
+  #gl{z-index:1;display:block}
+  #ui{position:fixed;left:0;right:0;top:0;z-index:10;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+      padding:max(8px,env(safe-area-inset-top)) 10px 8px;background:linear-gradient(rgba(0,0,0,.6),rgba(0,0,0,0))}
+  #status{flex:1;min-width:120px;text-shadow:0 1px 2px #000}
+  #status b{color:#7CFC9A}
+  button{font:inherit;color:#fff;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.55);
+         border-radius:10px;padding:9px 13px;min-height:44px}
+  button.on{background:#1f8f5a;border-color:#1f8f5a}
+  #load{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        background:#111;color:#eee;text-align:center;padding:24px}
+  #bar{width:min(320px,80vw);height:8px;background:#333;border-radius:4px;margin-top:14px;overflow:hidden}
+  #bar i{display:block;height:100%;width:0;background:#7CFC9A;transition:width .2s}
+  #load small{opacity:.75;margin-top:18px;max-width:440px}
+  #go{margin-top:22px;font-size:17px;padding:12px 22px;background:#1f8f5a;border-color:#1f8f5a;display:none}
+  #diag{position:fixed;left:0;right:0;bottom:0;z-index:30;max-height:40vh;overflow:auto;margin:0;padding:8px 10px;
+        background:rgba(0,0,0,.72);color:#ffd54a;font:12px/1.35 monospace;white-space:pre-wrap;display:none}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted autoplay></video>
+<canvas id="gl"></canvas>
+
+<div id="load">
+  <div id="loadtxt">Načítám model kostela…</div>
+  <div id="bar"><i></i></div>
+  <button id="go" type="button">Spustit kameru</button>
+  <small>Pak namiřte telefon na černý marker – LEGO kostel sv. Jakuba se objeví ve skutečné velikosti modelu. Držte se asi 0,7–1,5 m od markeru, aby byl celý v záběru.</small>
+</div>
+<div id="ui">
+  <div id="status">Spouštím…</div>
+  <button id="btnCheck" type="button">Kontrola</button>
+  <button id="btnFull" type="button">Celá obrazovka</button>
+</div>
+<pre id="diag"></pre>
+
+<script>
+// ===================== NASTAVENÍ =====================
+// Souřadnice v metrech, počátek = střed půdorysu LEGO modelu na podlaze / stole.
+// Osa X = dlouhá strana kostela (věž je na straně -X), osa Z = krátká strana.
+window.CONFIG = {
+  // JEDEN marker leží uprostřed půdorysu modelu (model je virtuální, marker nezakrývá)
+  markerSize: 0.18,          // černý čtverec 18 cm (list A4)
+  markers: [
+    { id: 1, x: 0.00, z: 0.00, dir: [0, 1] },   // horní okraj (▲ PŘEDNÍ STRANA ▲) míří k přední dlouhé straně
+  ],
+  hideAfterMs: 500,          // jak dlouho model zůstane po ztrátě markeru
+  procLongSide: 960,         // rozlišení pro hledání markerů (menší = rychlejší, ?proc=640)
+  focalDefault: 0.75         // ohnisko jako násobek delší strany obrazu (doladí se samo)
+};
+</script>
+<script>
+/* ===== detektor markerů (vložený přímo do stránky) ===== */
+/* Square-marker detector + planar pose for the 4 printed markers (8x8 grid: 2-cell black border + 4x4 code).
+   Plain script: works in the browser (window.MarkerDetector) and in Node (module.exports). No dependencies. */
+(function (root) {
+  'use strict';
+  // 1 = black cell, row 0 = top of the printed marker (side with the "▲ MARKER n ▲" label)
+  const CODES = {
+    1: [[0,0,1,0],[1,0,1,1],[1,0,1,1],[1,0,0,0]],
+    2: [[1,0,0,0],[1,0,0,0],[1,0,1,0],[0,1,0,1]],
+    3: [[1,0,1,1],[1,0,1,0],[1,1,0,1],[0,0,1,1]],
+    4: [[1,1,0,0],[1,1,0,0],[1,0,0,1],[1,0,1,0]],
+  };
+  const rot = b => b.map((_, i) => b.map((_, j) => b[j][b.length - 1 - i])); // 90° counter-clockwise
+  // marker with a QR code inside: 8x8 cells, 1-cell black border, 20-cell code ring, centre 4x4 = QR zone (ignored)
+  const RING = { 1: [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 1, 1, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 0, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1, 0, 1], [1, 1, 1, 1, 1, 1, 1, 1]] };
+  const RING_CELLS = [];
+  for (let r = 1; r <= 6; r++) for (let c = 1; c <= 6; c++) if (r === 1 || r === 6 || c === 1 || c === 6) RING_CELLS.push([r, c]);
+
+  function adaptiveBinary(gray, w, h) {
+    const W1 = w + 1, I = new Float64Array(W1 * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let s = 0;
+      for (let x = 0; x < w; x++) { s += gray[y * w + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + s; }
+    }
+    const r = Math.max(8, Math.round(Math.min(w, h) / 8));
+    const bin = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+        const m = (I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]) / ((x1 - x0) * (y1 - y0));
+        bin[y * w + x] = gray[y * w + x] < m - Math.max(6, 0.08 * m) ? 1 : 0;
+      }
+    }
+    return bin;
+  }
+
+  function hull(pts) { // Andrew monotone chain, pts: array of [x,y]
+    pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], up = [];
+    for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+    for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+    up.pop(); lo.pop(); return lo.concat(up);
+  }
+  const polyArea = P => { let a = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; } return a / 2; };
+
+  function quadFromHull(H) {
+    let cx = 0, cy = 0; for (const p of H) { cx += p[0]; cy += p[1]; } cx /= H.length; cy /= H.length;
+    const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
+    let p0 = H[0]; for (const p of H) if (d2(p, [cx, cy]) > d2(p0, [cx, cy])) p0 = p;
+    let p2 = H[0]; for (const p of H) if (d2(p, p0) > d2(p2, p0)) p2 = p;
+    const side = p => (p2[0] - p0[0]) * (p[1] - p0[1]) - (p2[1] - p0[1]) * (p[0] - p0[0]);
+    let p1 = null, p3 = null, s1 = 0, s3 = 0;
+    for (const p of H) { const s = side(p); if (s > s1) { s1 = s; p1 = p; } if (s < s3) { s3 = s; p3 = p; } }
+    if (!p1 || !p3) return null;
+    let q = [p0, p1, p2, p3];
+    if (polyArea(q) < 0) q = [p0, p3, p2, p1]; // clockwise on screen (y down) => positive shoelace
+    return q.map(p => [p[0], p[1]]);
+  }
+
+  function refineCorners(q, bnd) { // fit a line to boundary pixels along each side, intersect
+    const lines = [];
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
+      const nx = -dy / L, ny = dx / L, tol = Math.max(2, 0.04 * L);
+      let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+      for (let k = 0; k < bnd.length; k += 2) {
+        const px = bnd[k], py = bnd[k + 1];
+        const t = ((px - a[0]) * dx + (py - a[1]) * dy) / (L * L);
+        if (t < 0.12 || t > 0.88) continue;
+        if (Math.abs((px - a[0]) * nx + (py - a[1]) * ny) > tol) continue;
+        n++; sx += px; sy += py; sxx += px * px; syy += py * py; sxy += px * py;
+      }
+      if (n < 6) return q;
+      const mx = sx / n, my = sy / n, cxx = sxx / n - mx * mx, cyy = syy / n - my * my, cxy = sxy / n - mx * my;
+      const ang = 0.5 * Math.atan2(2 * cxy, cxx - cyy); // direction of max variance
+      lines.push({ px: mx, py: my, dx: Math.cos(ang), dy: Math.sin(ang) });
+    }
+    const out = [];
+    for (let i = 0; i < 4; i++) {
+      const l1 = lines[(i + 3) % 4], l2 = lines[i];
+      const det = l1.dx * l2.dy - l1.dy * l2.dx; if (Math.abs(det) < 1e-6) return q;
+      const t = ((l2.px - l1.px) * l2.dy - (l2.py - l1.py) * l2.dx) / det;
+      const p = [l1.px + t * l1.dx, l1.py + t * l1.dy];
+      if (Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) > 0.15 * Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]) + 3) return q;
+      out.push(p);
+    }
+    return out;
+  }
+
+
+  // sub-pixel edge refinement on the grey image: max-gradient along normals, parabolic peak, line fit
+  function refineSubpixel(gray, w, h, q) {
+    const bil = (x, y) => {
+      if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return NaN;
+      const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+      return gray[i] * (1 - fx) * (1 - fy) + gray[i + 1] * fx * (1 - fy) + gray[i + w] * (1 - fx) * fy + gray[i + w + 1] * fx * fy;
+    };
+    let cx = 0, cy = 0; for (const p of q) { cx += p[0] / 4; cy += p[1] / 4; }
+    const lines = [];
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
+      let nx = -dy / L, ny = dx / L;
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      if ((mx - cx) * nx + (my - cy) * ny < 0) { nx = -nx; ny = -ny; }   // normal points outwards (dark -> bright)
+      const R = Math.max(3, Math.min(8, 0.06 * L)), st = 0.5, N = Math.max(8, Math.min(40, Math.round(L / 4)));
+      const pts = [];
+      for (let k = 0; k < N; k++) {
+        const t = 0.12 + 0.76 * k / (N - 1), bx = a[0] + dx * t, by = a[1] + dy * t;
+        const prof = [];
+        for (let s = -R; s <= R + 1e-9; s += st) prof.push(bil(bx + nx * s, by + ny * s));
+        if (prof.some(isNaN)) continue;
+        let best = -1, bi = -1;
+        for (let j = 1; j < prof.length - 1; j++) { const g = prof[j + 1] - prof[j - 1]; if (g > best) { best = g; bi = j; } }
+        if (bi < 2 || bi > prof.length - 3 || best < 8) continue;
+        const g0 = prof[bi] - prof[bi - 2], g1 = best, g2 = prof[bi + 2] - prof[bi];
+        const den = g0 - 2 * g1 + g2, off = den !== 0 ? 0.5 * (g0 - g2) / den : 0;
+        const s = -R + (bi + Math.max(-1, Math.min(1, off))) * st;
+        pts.push([bx + nx * s, by + ny * s]);
+      }
+      if (pts.length < 5) return q;
+      let sx = 0, sy = 0; for (const p of pts) { sx += p[0]; sy += p[1]; } sx /= pts.length; sy /= pts.length;
+      let cxx = 0, cyy = 0, cxy = 0; for (const p of pts) { const u = p[0] - sx, v = p[1] - sy; cxx += u * u; cyy += v * v; cxy += u * v; }
+      const ang = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+      lines.push({ px: sx, py: sy, dx: Math.cos(ang), dy: Math.sin(ang) });
+    }
+    const out = [];
+    for (let i = 0; i < 4; i++) {
+      const l1 = lines[(i + 3) % 4], l2 = lines[i];
+      const det = l1.dx * l2.dy - l1.dy * l2.dx; if (Math.abs(det) < 1e-6) return q;
+      const t = ((l2.px - l1.px) * l2.dy - (l2.py - l1.py) * l2.dx) / det;
+      const p = [l1.px + t * l1.dx, l1.py + t * l1.dy];
+      if (Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) > 4) return q;
+      out.push(p);
+    }
+    return out;
+  }
+
+  // homography mapping src points (4) to dst points (4); returns 3x3 row-major array
+  function homography(src, dst) {
+    const A = [], B = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = src[i], [u, v] = dst[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); B.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); B.push(v);
+    }
+    const n = 8; // gaussian elimination
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+      [A[c], A[p]] = [A[p], A[c]]; [B[c], B[p]] = [B[p], B[c]];
+      if (Math.abs(A[c][c]) < 1e-12) return null;
+      for (let r = 0; r < n; r++) if (r !== c) { const f = A[r][c] / A[c][c]; for (let k = c; k < n; k++) A[r][k] -= f * A[c][k]; B[r] -= f * B[c]; }
+    }
+    const h = B.map((b, i) => b / A[i][i]);
+    return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+  }
+  const applyH = (H, x, y) => { const w = H[6] * x + H[7] * y + H[8]; return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w]; };
+
+  function sampleGrid(gray, w, h, q) {
+    const H = homography([[0, 0], [1, 0], [1, 1], [0, 1]], q); if (!H) return null;
+    const bil = (x, y) => {
+      if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return -1;
+      const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+      return gray[i] * (1 - fx) * (1 - fy) + gray[i + 1] * fx * (1 - fy) + gray[i + w] * (1 - fx) * fy + gray[i + w + 1] * fx * fy;
+    };
+    const v = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+      let s = 0;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+        const [x, y] = applyH(H, (c + 0.5 + 0.22 * b) / 8, (r + 0.5 + 0.22 * a) / 8);
+        const g = bil(x, y); if (g < 0) return null; s += g;
+      }
+      v.push(s / 9);
+    }
+    return v;
+  }
+
+  function decode(vals) {
+    return decodeClassic(vals) || decodeRing(vals);
+  }
+  function decodeClassic(vals) {
+    const mn = Math.min(...vals), mx = Math.max(...vals);
+    if (mx - mn < 25) return null;
+    const thr = (mn + mx) / 2;
+    const cell = (r, c) => vals[r * 8 + c] < thr ? 1 : 0;
+    let borderWhite = 0;
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++)
+      if ((r < 2 || r > 5 || c < 2 || c > 5) && !cell(r, c)) borderWhite++;
+    if (borderWhite > 3) return null;
+    let b = [0, 1, 2, 3].map(r => [0, 1, 2, 3].map(c => cell(r + 2, c + 2)));
+    let best = null;
+    for (let k = 0; k < 4; k++) {
+      for (const id in CODES) {
+        let d = 0; const C = CODES[id];
+        for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) d += b[r][c] !== C[r][c];
+        if (!best || d < best.d) best = { id: +id, k, d };
+      }
+      b = rot(b);
+    }
+    return best && best.d <= 2 ? best : null;
+  }
+  function decodeRing(vals) {
+    const used = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) if (r < 2 || r > 5 || c < 2 || c > 5) used.push(vals[r * 8 + c]);
+    const mn = Math.min(...used), mx = Math.max(...used);
+    if (mx - mn < 25) return null;
+    const thr = (mn + mx) / 2;
+    let g = [];
+    for (let r = 0; r < 8; r++) { const row = []; for (let c = 0; c < 8; c++) row.push(vals[r * 8 + c] < thr ? 1 : 0); g.push(row); }
+    let borderWhite = 0;
+    for (let i = 0; i < 8; i++) { borderWhite += !g[0][i] + !g[7][i]; if (i > 0 && i < 7) borderWhite += !g[i][0] + !g[i][7]; }
+    if (borderWhite > 2) return null;
+    let best = null;
+    for (let k = 0; k < 4; k++) {
+      for (const id in RING) {
+        const C = RING[id]; let d = 0;
+        for (const [r, c] of RING_CELLS) d += g[r][c] !== C[r][c];
+        if (!best || d < best.d) best = { id: +id, k, d, ring: true };
+      }
+      g = rot(g);
+    }
+    return best && best.d <= 3 ? best : null;
+  }
+
+  function detect(gray, w, h, opt) {
+    opt = opt || {};
+    const minSide = opt.minSide || Math.max(16, Math.round(Math.min(w, h) * 0.04));
+    const bin = adaptiveBinary(gray, w, h);
+    const lab = new Int32Array(w * h), stack = new Int32Array(w * h);
+    const found = [];
+    let label = 0;
+    for (let start = 0; start < w * h; start++) {
+      if (!bin[start] || lab[start]) continue;
+      label++;
+      let sp = 0; stack[sp++] = start; lab[start] = label;
+      let area = 0, minx = w, maxx = 0, miny = h, maxy = 0, touches = false;
+      const bnd = [];
+      while (sp) {
+        const p = stack[--sp], x = p % w, y = (p / w) | 0;
+        area++;
+        if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+        if (x === 0 || y === 0 || x === w - 1 || y === h - 1) { touches = true; bnd.push(x, y); continue; }
+        let edge = false;
+        const nb = [p - 1, p + 1, p - w, p + w];
+        for (const n of nb) {
+          if (bin[n]) { if (!lab[n]) { lab[n] = label; stack[sp++] = n; } }
+          else edge = true;
+        }
+        if (edge) bnd.push(x, y);
+      }
+      const bw = maxx - minx, bh = maxy - miny;
+      if (touches || bw < minSide || bh < minSide || area < minSide * minSide * 0.25) continue;
+      if (bw > 0.98 * w && bh > 0.98 * h) continue;
+      const pts = []; for (let k = 0; k < bnd.length; k += 2) pts.push([bnd[k], bnd[k + 1]]);
+      const Hh = hull(pts); if (Hh.length < 4) continue;
+      let q = quadFromHull(Hh); if (!q) continue;
+      const ha = Math.abs(polyArea(Hh)), qa = polyArea(q);
+      if (qa < 0.88 * ha) continue;                       // hull must be (nearly) a quadrilateral
+      const sides = q.map((p, i) => Math.hypot(q[(i + 1) % 4][0] - p[0], q[(i + 1) % 4][1] - p[1]));
+      if (Math.min(...sides) < minSide * 0.7 || Math.min(...sides) < 0.25 * Math.max(...sides)) continue;
+      q = refineCorners(q, bnd);
+      if (!opt.noSubpixel) q = refineSubpixel(gray, w, h, q);
+      const vals = sampleGrid(gray, w, h, q); if (!vals) continue;
+      const dec = decode(vals); if (!dec) continue;
+      const k = dec.k, corners = [0, 1, 2, 3].map(i => q[(i + k) % 4]); // TL, TR, BR, BL of the printed marker
+      found.push({ id: dec.id, corners, err: dec.d, area: qa });
+    }
+    // keep the largest detection per id
+    const best = {};
+    for (const m of found) if (!best[m.id] || m.area > best[m.id].area) best[m.id] = m;
+    return Object.values(best);
+  }
+
+  // ---------- pose ----------
+  // size = black square width (m); f, cx, cy in the same pixels as corners.
+  // returns { R: 3x3 rows, t: [x,y,z] } in OpenCV camera coords (x right, y down, z forward);
+  // marker frame: X = right edge, Y = towards the top (label) edge, Z = out of the paper.
+  function pose(corners, size, f, cx, cy) {
+    const s = size / 2;
+    const H = homography([[-s, s], [s, s], [s, -s], [-s, -s]], corners); if (!H) return null;
+    const col = j => [(H[j] - cx * H[6 + j]) / f, (H[3 + j] - cy * H[6 + j]) / f, H[6 + j]];
+    let h1 = col(0), h2 = col(1), h3 = col(2);
+    const n = v => Math.hypot(v[0], v[1], v[2]);
+    let lam = 2 / (n(h1) + n(h2)); if (h3[2] * lam < 0) lam = -lam;
+    const sc = (v, k) => v.map(x => x * k), add = (a, b) => a.map((x, i) => x + b[i]), sub = (a, b) => a.map((x, i) => x - b[i]);
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const nz = v => sc(v, 1 / n(v));
+    const x = nz(sc(h1, lam)), y = nz(sc(h2, lam));
+    const a = nz(add(x, y)), b = nz(sub(x, y));
+    const r1 = sc(add(a, b), Math.SQRT1_2), r2 = sc(sub(a, b), Math.SQRT1_2), r3 = cross(r1, r2);
+    const t = sc(h3, lam);
+    return { R: [[r1[0], r2[0], r3[0]], [r1[1], r2[1], r3[1]], [r1[2], r2[2], r3[2]]], t };
+  }
+
+  // focal length estimate from one marker (pixels), or null when ill-conditioned
+  function estimateFocal(corners, cx, cy) {
+    const H = homography([[-1, 1], [1, 1], [1, -1], [-1, -1]], corners.map(p => [p[0] - cx, p[1] - cy])); if (!H) return null;
+    const h11 = H[0], h12 = H[1], h21 = H[3], h22 = H[4], h31 = H[6], h32 = H[7];
+    const a1 = h11 * h12 + h21 * h22, b1 = h31 * h32;
+    const a2 = h11 * h11 + h21 * h21 - h12 * h12 - h22 * h22, b2 = h31 * h31 - h32 * h32;
+    const den = -(a1 * b1 + a2 * b2), num = b1 * b1 + b2 * b2;
+    // w = 1/f^2 minimizing (a w + b)^2  ->  w = -(a·b)/(a·a)  (written as f^2 = -(a·a)/(a·b))
+    const aa = a1 * a1 + a2 * a2, ab = a1 * b1 + a2 * b2;
+    if (ab >= 0 || num < 1e-14) return null;
+    const f2 = -aa / ab; if (!(f2 > 0)) return null;
+    return Math.sqrt(f2);
+  }
+
+
+  // least-squares homography (N >= 4 points) with Hartley normalisation; returns 3x3 row-major
+  function homographyLS(src, dst) {
+    const norm = P => { let mx = 0, my = 0; for (const p of P) { mx += p[0]; my += p[1]; } mx /= P.length; my /= P.length;
+      let d = 0; for (const p of P) d += Math.hypot(p[0] - mx, p[1] - my); d = d / P.length || 1; const k = Math.SQRT2 / d;
+      return { T: [k, 0, -k * mx, 0, k, -k * my, 0, 0, 1], P: P.map(p => [k * (p[0] - mx), k * (p[1] - my)]) }; };
+    const a = norm(src), b = norm(dst);
+    const AtA = Array.from({ length: 8 }, () => new Float64Array(8)), Atb = new Float64Array(8);
+    for (let i = 0; i < src.length; i++) {
+      const [x, y] = a.P[i], [u, v] = b.P[i];
+      const rows = [[x, y, 1, 0, 0, 0, -u * x, -u * y, u], [0, 0, 0, x, y, 1, -v * x, -v * y, v]];
+      for (const r of rows) for (let p = 0; p < 8; p++) { Atb[p] += r[p] * r[8]; for (let q = 0; q < 8; q++) AtA[p][q] += r[p] * r[q]; }
+    }
+    const A = AtA.map(r => Array.from(r)), B = Array.from(Atb), n = 8;
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+      [A[c], A[p]] = [A[p], A[c]]; [B[c], B[p]] = [B[p], B[c]];
+      if (Math.abs(A[c][c]) < 1e-12) return null;
+      for (let r = 0; r < n; r++) if (r !== c) { const f = A[r][c] / A[c][c]; for (let k = c; k < n; k++) A[r][k] -= f * A[c][k]; B[r] -= f * B[c]; }
+    }
+    const h = B.map((v, i) => v / A[i][i]); const Hn = [...h, 1];
+    // H = Tb^-1 * Hn * Ta
+    const mul = (X, Y) => { const Z = new Array(9).fill(0); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) Z[i * 3 + j] += X[i * 3 + k] * Y[k * 3 + j]; return Z; };
+    const kb = b.T[0], Tbi = [1 / kb, 0, -b.T[2] / kb, 0, 1 / kb, -b.T[5] / kb, 0, 0, 1];
+    const H = mul(mul(Tbi, Hn), a.T);
+    return H.map(v => v / H[8]);
+  }
+  function poseFromH(H, f, cx, cy) {
+    const col = j => [(H[j] - cx * H[6 + j]) / f, (H[3 + j] - cy * H[6 + j]) / f, H[6 + j]];
+    const h1 = col(0), h2 = col(1), h3 = col(2);
+    const n = v => Math.hypot(v[0], v[1], v[2]);
+    let lam = 2 / (n(h1) + n(h2)); if (h3[2] * lam < 0) lam = -lam;
+    const sc = (v, k) => v.map(x => x * k), add = (a, b) => a.map((x, i) => x + b[i]), sub = (a, b) => a.map((x, i) => x - b[i]);
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const nz = v => sc(v, 1 / n(v));
+    const x = nz(sc(h1, lam)), y = nz(sc(h2, lam)), a = nz(add(x, y)), b = nz(sub(x, y));
+    const r1 = sc(add(a, b), Math.SQRT1_2), r2 = sc(sub(a, b), Math.SQRT1_2), r3 = cross(r1, r2);
+    return { R: [[r1[0], r2[0], r3[0]], [r1[1], r2[1], r3[1]], [r1[2], r2[2], r3[2]]], t: sc(h3, lam) };
+  }
+  // pose of a plane from N >= 4 correspondences: obj = [[X,Y],...] (m, plane frame), img = [[u,v],...] (px)
+  function posePlane(obj, img, f, cx, cy) { const H = homographyLS(obj, img); return H ? poseFromH(H, f, cx, cy) : null; }
+  // focal from a plane homography (any number of points); null when ill-conditioned
+  function focalPlane(obj, img, cx, cy) {
+    const H = homographyLS(obj, img.map(p => [p[0] - cx, p[1] - cy])); if (!H) return null;
+    const h11 = H[0], h12 = H[1], h21 = H[3], h22 = H[4], h31 = H[6], h32 = H[7];
+    const a1 = h11 * h12 + h21 * h22, b1 = h31 * h32, a2 = h11 * h11 + h21 * h21 - h12 * h12 - h22 * h22, b2 = h31 * h31 - h32 * h32;
+    const aa = a1 * a1 + a2 * a2, ab = a1 * b1 + a2 * b2;
+    if (ab >= 0) return null; const f2 = -aa / ab; return f2 > 0 ? Math.sqrt(f2) : null;
+  }
+
+
+  // replace the plane normal by the measured "up" (gravity) and re-solve the translation by least squares.
+  // pose: {R,t} of the floor frame in camera (cv); up: unit vector in camera coords; w: weight of gravity (0..1)
+  function fuseUp(pose, up, obj, img, f, cx, cy, w) {
+    const R = pose.R, col = j => [R[0][j], R[1][j], R[2][j]];
+    const nrm = v => { const l = Math.hypot(v[0], v[1], v[2]); return v.map(x => x / l); };
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const r3m = col(2);
+    const n = nrm(r3m.map((x, i) => (1 - w) * x + w * up[i]));
+    let r1 = col(0); const d = dot(r1, n); r1 = nrm(r1.map((x, i) => x - d * n[i]));
+    const r2 = cross(n, r1);
+    const Rn = [[r1[0], r2[0], n[0]], [r1[1], r2[1], n[1]], [r1[2], r2[2], n[2]]];
+    // linear LS for t:  f*tx - (u-cx)*tz = (u-cx)*Zc - f*Xc ; f*ty - (v-cy)*tz = (v-cy)*Zc - f*Yc
+    const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], b = [0, 0, 0];
+    for (let i = 0; i < obj.length; i++) {
+      const X = obj[i][0], Y = obj[i][1];
+      const Xc = Rn[0][0] * X + Rn[0][1] * Y, Yc = Rn[1][0] * X + Rn[1][1] * Y, Zc = Rn[2][0] * X + Rn[2][1] * Y;
+      const du = img[i][0] - cx, dv = img[i][1] - cy;
+      const rows = [[f, 0, -du, du * Zc - f * Xc], [0, f, -dv, dv * Zc - f * Yc]];
+      for (const r of rows) for (let p = 0; p < 3; p++) { b[p] += r[p] * r[3]; for (let q = 0; q < 3; q++) A[p][q] += r[p] * r[q]; }
+    }
+    const det3 = M => M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+    const D = det3(A); if (Math.abs(D) < 1e-12) return pose;
+    const t = [0, 1, 2].map(k => det3(A.map((row, i) => row.map((v, j) => j === k ? b[i] : v))) / D);
+    if (!(t[2] > 0)) return pose;
+    return { R: Rn, t };
+  }
+
+  const api = { RING, fuseUp, detect, pose, estimateFocal, homography, homographyLS, posePlane, focalPlane, CODES };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.MarkerDetector = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const CFG = window.CONFIG;
+const Q = new URLSearchParams(location.search);
+const TEST = false, DEBUG = Q.has('debug');   // vždy skutečná velikost 1:1
+const OTOC = +(Q.get('otoc') || 0);
+const SIZE = CFG.markerSize;
+const S = SIZE / CFG.markerSize;
+const $ = id => document.getElementById(id);
+const diagEl = $('diag');
+function diag(msg, err) { if (DEBUG || err) diagEl.style.display = 'block'; diagEl.textContent += (err ? '⚠ ' : '· ') + msg + '\n'; }
+window.addEventListener('error', e => diag('Chyba: ' + e.message, true));
+window.addEventListener('unhandledrejection', e => diag('Chyba: ' + (e.reason && e.reason.message || e.reason), true));
+
+// ---------- three.js ----------
+const canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true, powerPreference: 'high-performance' });
+renderer.setClearColor(0x000000, 0);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.Camera();               // identity pose; projection set from the camera intrinsics
+const anchor = new THREE.Group();                // model space (metres, Y up)
+anchor.matrixAutoUpdate = false; anchor.visible = false;
+scene.add(anchor);
+const content = new THREE.Group(); anchor.add(content);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8070, 1.6); hemi.position.set(0, 1, 0); content.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(1.5, 3, 2); content.add(sun);
+
+// control outlines of the printed sheets (in model space)
+const check = new THREE.Group(); check.visible = false; content.add(check);
+for (const m of CFG.markers) {
+  const g = new THREE.Group();
+  g.position.set(m.x, 0.002, m.z);
+  g.rotation.y = Math.atan2(-m.dir[0], -m.dir[1]) + OTOC * Math.PI / 180;
+  const s = CFG.markerSize;
+  const sq = new THREE.Mesh(new THREE.PlaneGeometry(s, s), new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, depthTest: false }));
+  sq.rotation.x = -Math.PI / 2; sq.renderOrder = 10; g.add(sq);
+  const dot = new THREE.Mesh(new THREE.CircleGeometry(0.04, 20), new THREE.MeshBasicMaterial({ color: 0xff2d75, side: THREE.DoubleSide, depthTest: false }));
+  dot.rotation.x = -Math.PI / 2; dot.position.set(0, 0.003, -s / 2 + 0.06); dot.renderOrder = 11; g.add(dot);
+  check.add(g);
+}
+
+// offset: marker frame -> model frame. Marker frame: X = right edge, Y = towards label edge, Z = up (out of paper)
+function offsetFor(m) {
+  const d = new THREE.Vector3(m.dir[0], 0, m.dir[1]).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), OTOC * Math.PI / 180);
+  const up = new THREE.Vector3(0, 1, 0);
+  const right = new THREE.Vector3().crossVectors(d, up);
+  const T = new THREE.Matrix4().makeBasis(right, d, up).setPosition(m.x * S, 0, m.z * S);
+  return T.invert().multiply(new THREE.Matrix4().makeScale(S, S, S));
+}
+const OFF = {}; for (const m of CFG.markers) OFF[m.id] = offsetFor(m);
+// marker corners (TL, TR, BR, BL) in floor-plane coords (X = model x, Y = -model z), real metres (scaled in test mode)
+const FLOOR = {};
+for (const m of CFG.markers) {
+  const d = new THREE.Vector3(m.dir[0], 0, m.dir[1]).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), OTOC * Math.PI / 180);
+  const right = new THREE.Vector3().crossVectors(d, new THREE.Vector3(0, 1, 0));
+  const c = new THREE.Vector3(m.x * S, 0, m.z * S), h = SIZE / 2;
+  FLOOR[m.id] = [[-h, h], [h, h], [h, -h], [-h, -h]].map(([X, Y]) => {
+    const p = c.clone().addScaledVector(right, X).addScaledVector(d, Y); return [p.x, -p.z]; });
+}
+
+
+const CV2GL = new THREE.Matrix4().makeScale(1, -1, -1);
+const MODEL2FLOOR = new THREE.Matrix4().set(1, 0, 0, 0,  0, 0, -1, 0,  0, 1, 0, 0,  0, 0, 0, 1).multiply(new THREE.Matrix4().makeScale(S, S, S));
+
+// ---------- model ----------
+const loader = new GLTFLoader();
+let modelReady = false;
+loader.load('model.glb', g => {
+  content.add(g.scene); modelReady = true;
+  $('loadtxt').textContent = 'Model je připraven.'; $('bar').firstChild.style.width = '100%';
+  startCamera();
+}, e => {
+  if (e.total) { $('bar').firstChild.style.width = (100 * e.loaded / e.total).toFixed(0) + '%';
+    $('loadtxt').textContent = 'Načítám model kostela… ' + (e.loaded / 1048576).toFixed(1) + ' / ' + (e.total / 1048576).toFixed(1) + ' MB'; }
+}, err => { $('loadtxt').textContent = 'Model se nepodařilo načíst: ' + (err.message || err); diag('model: ' + (err.message || err), true); });
+
+// ---------- camera ----------
+const video = $('v');
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    video.srcObject = stream;
+    await video.play();
+    $('load').remove();
+    diag('kamera ' + video.videoWidth + '×' + video.videoHeight);
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $('loadtxt').textContent = 'Klepněte na tlačítko a povolte přístup ke kameře.';
+    const b = $('go'); b.style.display = 'inline-block'; b.onclick = () => { b.style.display = 'none'; startCamera(); };
+    diag('kamera: ' + e.message, true);
+  }
+}
+
+// ---------- projection from intrinsics, honouring object-fit: cover ----------
+let fUnits = CFG.focalDefault;            // focal / long side of the video
+const fSamples = [];
+const fOverride = Q.has('f') ? +Q.get('f') : 0;
+let lastW = 0, lastH = 0, lastVW = 0, lastVH = 0, lastF = 0;
+function updateProjection(vw, vh) {
+  const W = innerWidth, H = innerHeight;
+  const f = (fOverride || fUnits) * Math.max(vw, vh);
+  if (W === lastW && H === lastH && vw === lastVW && vh === lastVH && Math.abs(f - lastF) < 0.5) return;
+  lastW = W; lastH = H; lastVW = vw; lastVH = vh; lastF = f;
+  renderer.setSize(W, H, false);
+  const sc = Math.max(W / vw, H / vh), ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+  const cx = vw / 2, cy = vh / 2, n = 0.05, fa = 60;
+  const a = 2 * sc * f / W, bx = 2 * (ox + cx * sc) / W - 1, c = 2 * sc * f / H, by = 1 - 2 * (oy + cy * sc) / H;
+  camera.projectionMatrix.set(
+    a, 0, -bx, 0,
+    0, c, -by, 0,
+    0, 0, -(fa + n) / (fa - n), -2 * fa * n / (fa - n),
+    0, 0, -1, 0);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+}
+
+
+// ---------- stabilisation ----------
+const STAB = Q.has('stab') ? +Q.get('stab') : 2;      // 0 = vypnuto, 1 = jen filtr, 2 = filtr + gravitace (výchozí)
+class OneEuro {                                         // adaptive low-pass: strong when still, light when moving
+  constructor(n, minCutoff, beta, dCutoff = 1) { this.n = n; this.mc = minCutoff; this.b = beta; this.dc = dCutoff; this.x = null; }
+  reset() { this.x = null; }
+  filter(v, tms) {
+    if (!this.x) { this.x = v.slice(); this.dx = v.map(() => 0); this.t = tms; return v.slice(); }
+    const dt = Math.max(1e-3, (tms - this.t) / 1000); this.t = tms;
+    const al = c => 1 / (1 + 1 / (2 * Math.PI * c * dt));
+    const ad = al(this.dc);
+    let sp = 0;
+    for (let i = 0; i < this.n; i++) { const d = (v[i] - this.x[i]) / dt; this.dx[i] += ad * (d - this.dx[i]); sp += this.dx[i] * this.dx[i]; }
+    const a = al(this.mc + this.b * Math.sqrt(sp));
+    for (let i = 0; i < this.n; i++) this.x[i] += a * (v[i] - this.x[i]);
+    return this.x.slice();
+  }
+}
+const fPos = new OneEuro(3, 0.9, 3.0), fRot = new OneEuro(4, 0.9, 2.0);
+// gravity from the accelerometer (Android Chrome: devicemotion, no permission needed)
+let grav = null, shake = 0, gravEvents = 0;
+addEventListener('devicemotion', e => {
+  const a = e.accelerationIncludingGravity; if (!a || a.x == null) return;
+  const v = [a.x, a.y, a.z], m = Math.hypot(...v); if (!m) return;
+  gravEvents++;
+  shake = 0.9 * shake + 0.1 * Math.abs(m - 9.81);
+  grav = grav ? grav.map((g, i) => g + 0.12 * (v[i] - g)) : v;
+});
+// the axis mapping device -> camera depends on the screen rotation; pick the candidate that agrees with the markers
+const gScore = [0, 0, 0, 0]; let gN = 0;
+function upCandidates() {
+  if (!grav) return null;
+  const l = Math.hypot(...grav), [x, y, z] = grav.map(v => v / l);
+  return [[x, y], [y, -x], [-x, -y], [-y, x]].map(([sx, sy]) => [sx, -sy, -z]);   // cv camera: x right, y down, z forward
+}
+let sigM2 = 0, prevN = null;       // jitter of the marker-derived floor normal (rad^2, EMA)
+let gravW = 0, gravK = -1;
+
+// ---------- main loop ----------
+const proc = document.createElement('canvas');
+const pctx = proc.getContext('2d', { willReadFrequently: true });
+let current = null, lastSeen = -1e9, frames = 0, fpsT = performance.now(), fps = 0;
+const smoothPos = new THREE.Vector3(), smoothQuat = new THREE.Quaternion(), smoothScale = new THREE.Vector3();
+const tmpPos = new THREE.Vector3(), tmpQuat = new THREE.Quaternion(), tmpScale = new THREE.Vector3();
+const status = $('status');
+
+function loop(t) {
+  requestAnimationFrame(loop);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh || video.readyState < 2) return;
+  updateProjection(vw, vh);
+  const k = Math.min(1, (+Q.get('proc') || CFG.procLongSide) / Math.max(vw, vh));
+  const pw = Math.round(vw * k), ph = Math.round(vh * k);
+  if (proc.width !== pw || proc.height !== ph) { proc.width = pw; proc.height = ph; }
+  pctx.drawImage(video, 0, 0, pw, ph);
+  const id = pctx.getImageData(0, 0, pw, ph).data;
+  const gray = new Uint8Array(pw * ph);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = (id[i] * 77 + id[i + 1] * 150 + id[i + 2] * 29) >> 8;
+  const det = MarkerDetector.detect(gray, pw, ph).filter(m => OFF[m.id]);
+  // all visible markers lie on one floor plane -> one joint pose (much more stable than a single marker)
+  const obj = [], img = [];
+  for (const m of det) for (let i = 0; i < 4; i++) { obj.push(FLOOR[m.id][i]); img.push(m.corners[i]); }
+  if (det.length) {   // focal self-calibration (median of plausible estimates)
+    const fe = MarkerDetector.focalPlane(obj, img, pw / 2, ph / 2);
+    if (fe) { const u = fe / Math.max(pw, ph); if (u > 0.55 && u < 1.25) { fSamples.push(u); if (fSamples.length > 61) fSamples.shift(); } }
+  }
+  if (fSamples.length >= 9) { const s = [...fSamples].sort((a, b) => a - b); fUnits = s[s.length >> 1]; }
+  if (det.length) {
+    const f = (fOverride || fUnits) * Math.max(pw, ph);
+    let P = MarkerDetector.posePlane(obj, img, f, pw / 2, ph / 2);
+    if (P && STAB >= 2 && MarkerDetector.fuseUp) {
+      const n = [P.R[0][2], P.R[1][2], P.R[2][2]];
+      if (prevN) { const c = Math.min(1, n[0] * prevN[0] + n[1] * prevN[1] + n[2] * prevN[2]); sigM2 = 0.9 * sigM2 + 0.1 * Math.acos(c) ** 2; }
+      prevN = prevN ? prevN.map((v, i) => v + 0.3 * (n[i] - v)) : n;
+      const C = upCandidates();
+      if (C) {
+        C.forEach((u, k) => { gScore[k] = 0.92 * gScore[k] + 0.08 * (u[0] * n[0] + u[1] * n[1] + u[2] * n[2]); }); gN++;
+        let k = 0; for (let i = 1; i < 4; i++) if (gScore[i] > gScore[k]) k = i;
+        gravK = (gN > 15 && gScore[k] > 0.93) ? k : -1;
+        if (gravK >= 0) {
+          const sg = (1.2 * Math.PI / 180) * (1 + 3 * shake);       // gravity accuracy, worse while shaking
+          gravW = Math.min(0.9, sigM2 / (sigM2 + sg * sg));
+          P = MarkerDetector.fuseUp(P, C[gravK], obj, img, f, pw / 2, ph / 2, gravW);
+        } else gravW = 0;
+      }
+    }
+    if (P) {
+      const R = P.R, tt = P.t;
+      const Mcv = new THREE.Matrix4().set(R[0][0], R[0][1], R[0][2], tt[0], R[1][0], R[1][1], R[1][2], tt[1], R[2][0], R[2][1], R[2][2], tt[2], 0, 0, 0, 1);
+      const M = CV2GL.clone().multiply(Mcv).multiply(MODEL2FLOOR);
+      M.decompose(tmpPos, tmpQuat, tmpScale);
+      const ids = det.map(m => m.id).sort().join(',');
+      const fresh = t - lastSeen > CFG.hideAfterMs;
+      if (fresh) { fPos.reset(); fRot.reset(); prevN = null; }
+      if (STAB >= 1) {
+        const p = fPos.filter([tmpPos.x, tmpPos.y, tmpPos.z], t);
+        let q = [tmpQuat.x, tmpQuat.y, tmpQuat.z, tmpQuat.w];
+        if (fRot.x && q[0] * fRot.x[0] + q[1] * fRot.x[1] + q[2] * fRot.x[2] + q[3] * fRot.x[3] < 0) q = q.map(v => -v);
+        q = fRot.filter(q, t);
+        smoothPos.set(p[0], p[1], p[2]); smoothQuat.set(q[0], q[1], q[2], q[3]).normalize(); smoothScale.copy(tmpScale);
+      } else { smoothPos.copy(tmpPos); smoothQuat.copy(tmpQuat); smoothScale.copy(tmpScale); }
+      anchor.matrix.compose(smoothPos, smoothQuat, smoothScale);
+      anchor.matrixWorldNeedsUpdate = true;
+      anchor.visible = modelReady;
+      current = ids; lastSeen = t;
+    }
+  } else if (t - lastSeen > CFG.hideAfterMs) { anchor.visible = false; current = null; }
+  renderer.render(scene, camera);
+  frames++; if (t - fpsT > 1000) { fps = frames * 1000 / (t - fpsT); frames = 0; fpsT = t; }
+  const seen = det.map(m => m.id).sort().join(', ');
+  status.innerHTML = (anchor.visible ? (det.length > 1 ? 'Markery <b>' : 'Marker <b>') + (seen || current) + '</b>' : 'Hledám marker…') + (TEST ? ' · TEST' : '') +
+    (DEBUG ? `<br><small>video ${vw}×${vh} · zpracování ${pw}×${ph} · ${fps.toFixed(0)} fps · ohnisko ${(fOverride || fUnits).toFixed(2)} (${fSamples.length}) · okno ${innerWidth}×${innerHeight}<br>stabilizace ${STAB} · gravitace ${gravK >= 0 ? 'ano (k' + gravK + ', váha ' + gravW.toFixed(2) + ')' : (grav ? 'kalibruji' : 'není')} · chvění markeru ${(Math.sqrt(sigM2) * 180 / Math.PI).toFixed(2)}°</small>` : '');
+}
+
+// ---------- buttons ----------
+$('btnCheck').addEventListener('click', e => { check.visible = !check.visible; e.currentTarget.classList.toggle('on', check.visible); });
+const btnFull = $('btnFull');
+btnFull.addEventListener('click', async () => {
+  try {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+      try { await screen.orientation.lock('portrait'); } catch (e) {}
+    } else await document.exitFullscreen();
+  } catch (e) { diag('celá obrazovka: ' + e.message, true); }
+});
+document.addEventListener('fullscreenchange', () => {
+  const on = !!document.fullscreenElement;
+  btnFull.textContent = on ? 'Ukončit' : 'Celá obrazovka';
+  btnFull.classList.toggle('on', on);
+  lastW = 0;
+});
+addEventListener('resize', () => { lastW = 0; });
+if (!document.documentElement.requestFullscreen) btnFull.style.display = 'none';
+if (!MarkerDetector.fuseUp) diag('detector.js je stará verze – nahrajte nový soubor na GitHub', true);
+diag('LEGO kostel · verze 1 · marker A4 · ' + (SIZE * 100).toFixed(0) + ' cm' + (TEST ? ' · TEST' : ''));
+</script>
+</body>
+</html>
